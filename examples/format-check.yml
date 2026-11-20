@@ -1,0 +1,11 @@
+name: Formatting check
+on:
+  pull_request:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  format:
+    uses: apursley2012/github-standards/.github/workflows/format.yml@v1
+    with:
+      mode: check

@@ -1,0 +1,77 @@
+name: Shared formatting
+on:
+  workflow_call:
+    inputs:
+      mode:
+        type: string
+        default: check
+jobs:
+  format:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+        with:
+          persist-credentials: ${{ inputs.mode == 'write' && github.event_name != 'pull_request' }}
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+      - name: Apply shared formatting
+        shell: bash
+        run: |
+          set -euo pipefail
+          export TOOL="$(mktemp -d)"
+          npm install --prefix "$TOOL" --ignore-scripts --no-audit --no-fund --save-exact prettier@3.6.2
+          cat > "$TOOL/config.json" <<'JSON'
+          {"printWidth":80,"tabWidth":2,"useTabs":false,"semi":true,"singleQuote":true,"trailingComma":"es5","endOfLine":"lf","htmlWhitespaceSensitivity":"css","proseWrap":"preserve"}
+          JSON
+          python3 - <<'PY'
+          import os, pathlib, re, subprocess
+          tool = pathlib.Path(os.environ["TOOL"])
+          header = re.compile(rb"(?m)^[ \t]*(?:<!--|/\*)[^\n]*\n[\s\S]*?(?:-->|\*/)[ \t]*(?=\r?$)")
+          for raw in subprocess.check_output(["git", "ls-files", "-z"]).split(b"\0"):
+              if not raw:
+                  continue
+              p = pathlib.Path(os.fsdecode(raw))
+              n = p.name.lower()
+              if not p.is_file() or p.is_symlink() or p.suffix.lower() not in {".html",".css",".scss",".js",".jsx",".mjs",".cjs",".ts",".tsx",".json",".yaml",".yml",".md"}:
+                  continue
+              if any(x.lower() in {"vendor","node_modules","dist","build","coverage","licenses","third-party","third_party"} for x in p.parts[:-1]) or n.startswith(("license","licence","notice","third-party","third_party")) or n.endswith((".min.js",".min.css",".lock.json")) or n in {"package-lock.json","npm-shrinkwrap.json"}:
+                  continue
+              original = p.read_bytes()
+              if b"\0" in original:
+                  continue
+              m = header.search(original[:8192])
+              protected = m.group() if m and b"Author:" in m.group() and b"Copyright" in m.group() else None
+              if b"Author:" in original[:8192] and b"Copyright" in original[:8192] and protected is None:
+                  print(f"Skipping unrecognized protected header: {p}")
+                  continue
+              if protected and any(len(x.decode("utf-8")) != 80 for x in protected.splitlines()):
+                  print(f"Header width requires review: {p}")
+              subprocess.run([str(tool / "node_modules/.bin/prettier"),"--config",str(tool / "config.json"),"--write","--",str(p)],check=True)
+              if protected:
+                  result = p.read_bytes()
+                  m = header.search(result[:8192])
+                  if not m or b"Author:" not in m.group():
+                      p.write_bytes(original)
+                      raise SystemExit(f"Cannot restore header: {p}")
+                  p.write_bytes(result[:m.start()] + protected + result[m.end():])
+          PY
+      - name: Check or commit changes
+        env:
+          MODE: ${{ inputs.mode }}
+          EVENT: ${{ github.event_name }}
+          REF_TYPE: ${{ github.ref_type }}
+        run: |
+          set -euo pipefail
+          if git diff --quiet; then exit 0; fi
+          git diff --stat
+          if [[ "$MODE" != write || "$EVENT" == pull_request || "$REF_TYPE" != branch ]]; then
+            echo "::error::Formatting changes required"
+            exit 1
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -u
+          git commit -m "Apply shared code formatting"
+          git push
